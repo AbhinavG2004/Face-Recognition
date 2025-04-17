@@ -1,195 +1,177 @@
-import cv2
-import numpy as np
-import torch
 import tkinter as tk
-from tkinter import Label, simpledialog
 from PIL import Image, ImageTk
-from torchvision import models, transforms
-from collections import deque
+import cv2
 import os
-import datetime
-
-# === Load pretrained ResNet18 model ===
-resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-resnet.fc = torch.nn.Identity()
-resnet.eval()
-
-# === Face detection using OpenCV ===
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-
-# === Preprocessing for face ===
-transform = transforms.Compose([
-    transforms.ToPILImage(),
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-])
-
-# === Database of embeddings ===
-known_embeddings = {}
-smoothing_window = 10
-smoothing_queue = deque(maxlen=smoothing_window)
-
-# === Load known embeddings from folder structure ===
-def load_known_faces(folder=os.path.join("Dataset", "Dataset", "Original Images", "Original Images")):
-    for person in os.listdir(folder):
-        person_folder = os.path.join(folder, person)
-        if not os.path.isdir(person_folder):
-            continue
-        embeddings = []
-        for img_name in os.listdir(person_folder):
-            img_path = os.path.join(person_folder, img_name)
-            if not img_path.lower().endswith((".jpg", ".jpeg", ".png")):
-                continue
-            img = cv2.imread(img_path)
-            if img is None:
-                continue
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-            for (x, y, w, h) in faces:
-                face = img[y:y + h, x:x + w]
-                if face.size == 0:
-                    continue
-                face_tensor = transform(face).unsqueeze(0)
+import time
+import threading
+from model import enhance_image, upscale_if_needed, segment_face, preprocess, model, match_face, detector, device
+import torch
+from datetime import datetime   
+# Path to save/load known faces
+known_faces_path = os.path.join("Dataset", "Faces", "Faces.pt")
+# Load known faces from the correct path
+if os.path.exists(known_faces_path):
+    known_faces = torch.load(known_faces_path)
+    print(f"[INFO] Loaded {len(known_faces)} known faces from {known_faces_path}")
+else:
+    known_faces = {}
+    print("[INFO] No known_faces.pt found. Starting with empty dictionary.")
+class FaceRecognitionApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Live Face Recognition")
+        self.video_label = tk.Label(root)
+        self.video_label.pack()
+        self.name_label = tk.Label(root, text="")
+        self.name_label.pack()
+        self.cap = None
+        self.running = False
+        self.last_predictions = []
+        self.last_update_time = 0
+        self.capture_stage = 0
+        self.captured_angles = []
+        self.capture_start_time = None
+        self.capturing_unknown = False
+        self.prompted_for_name = False
+        self.name_entry = None
+        self.submit_btn = None
+    def start_recognition(self):
+        self.cap = cv2.VideoCapture(0)
+        self.running = True
+        self.last_update_time = time.time()
+        self.update_frame()
+    def stop_recognition(self):
+        self.running = False
+        if self.cap:
+            self.cap.release()
+        self.cap = None
+    def prompt_for_name(self):
+        if not self.prompted_for_name:
+            self.prompted_for_name = True
+            self.name_label.config(text="Enter Name for Unknown Face:")
+            self.name_entry = tk.Entry(self.root)
+            self.name_entry.pack()
+            self.submit_btn = tk.Button(self.root, text="Submit", command=self.save_unknown_face)
+            self.submit_btn.pack()
+    def save_unknown_face(self):
+        name = self.name_entry.get().strip()
+        if name:
+            embeddings = []
+            for idx, img in enumerate(self.captured_angles):
+                filename = f"{name}{idx+1}.jpg"
+                path = os.path.join("Dataset", "Faces", filename)
+                cv2.imwrite(path, img)
+                rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                pil_img = Image.fromarray(rgb_img)
+                segmented_np = segment_face(pil_img)
+                segmented_face = Image.fromarray(segmented_np)
+                face_tensor = preprocess(segmented_face).unsqueeze(0).to(device)
                 with torch.no_grad():
-                    embedding = resnet(face_tensor).squeeze().numpy()
-                embeddings.append(embedding)
-        if embeddings:
-            known_embeddings[person] = np.stack(embeddings)
+                    embedding = model(face_tensor)
+                embeddings.append(embedding.squeeze(0))
+            if embeddings:
+                avg_embedding = torch.stack(embeddings).mean(dim=0)
+                known_faces[name] = avg_embedding
+                print(f"[INFO] Saved images and embedding for {name}")
+                torch.save(known_faces, known_faces_path)
+                print(f"[INFO] Updated known faces at {known_faces_path}")
+                self.name_label.config(text=f"Face for {name} saved and added to known faces.")
+        else:
+            print("[WARN] Name is empty. Skipping save.")
+        self.prompted_for_name = False
+        self.capturing_unknown = False
+        self.capture_stage = 0
+        self.captured_angles = []
+        self.name_entry.destroy()
+        self.submit_btn.destroy()
+    def update_frame(self):
+        if not self.running or not self.cap:
+            return
+        ret, frame = self.cap.read()
+        if not ret:
+            self.root.after(10, self.update_frame)
+            return
+        display_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(display_frame)
+        imgtk = ImageTk.PhotoImage(image=pil_img)
+        self.video_label.imgtk = imgtk
+        self.video_label.configure(image=imgtk)
+        current_time = time.time()
+        if current_time - self.last_update_time > 2:
+            self.last_update_time = current_time
+            threading.Thread(target=self.process_frame, args=(frame.copy(),)).start()
 
-load_known_faces()
+        for (left, top, right, bottom), identity in self.last_predictions:
+            cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+            cv2.putText(frame, identity, (left, top - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        self.root.after(10, self.update_frame)
+    def process_frame(self, frame):
+        try:
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            enhanced_frame = enhance_image(rgb_frame)
+            enhanced_frame = upscale_if_needed(enhanced_frame)
+            pil_frame = Image.fromarray(enhanced_frame)
 
-# === Compare embeddings with threshold ===
-def recognize_face(face_img, threshold=0.6):
-    if face_img.size == 0:
-        return "Unknown"
-    face_tensor = transform(face_img).unsqueeze(0)
-    with torch.no_grad():
-        embedding = resnet(face_tensor).squeeze().numpy()
+            try:
+                boxes, probs = detector.detect(pil_frame, landmarks=False)
+                if boxes is None or len(boxes) == 0:
+                    print("[DEBUG] No faces detected.")
+                else:
+                    print(f"[DEBUG] Detected {len(boxes)} face(s).")
+            except Exception as e:
+                print("[ERROR] Detector failed:", e)
+                boxes, probs = None, None
+            predictions = []
+            if boxes is not None:
+                for i, box in enumerate(boxes):
+                    if probs[i] < 0.9:
+                        continue
+                    left, top, right, bottom = map(int, box)
+                    face_crop = pil_frame.crop((left, top, right, bottom))
+                    segmented_np = segment_face(face_crop)
+                    segmented_face = Image.fromarray(segmented_np)
 
-    min_dist = float("inf")
-    best_match = "Unknown"
+                    try:
+                        face_tensor = preprocess(segmented_face).unsqueeze(0).to(device)
+                        with torch.no_grad():
+                            embedding = model(face_tensor)
 
-    for name, embeddings in known_embeddings.items():
-        dists = np.linalg.norm(embeddings - embedding, axis=1)
-        mean_dist = np.mean(dists)
-        if mean_dist < min_dist:
-            min_dist = mean_dist
-            best_match = name
+                        identity = match_face(embedding[0], known_faces, threshold=0.65)
+                        print(f"[DEBUG] Detected Identity: {identity}")
+                    except Exception as e:
+                        print("[ERROR] Face recognition failed:", e)
+                        identity = "Unknown"
 
-    if min_dist < threshold:
-        return best_match
-    else:
-        return "Unknown"
+                    predictions.append(((left, top, right, bottom), identity))
+                    self.name_label.config(text=f"Detected: {identity}")
 
-# === Try different camera indices ===
-def get_camera():
-    for i in range(3):  # try camera 0, 1, 2
-        cap = cv2.VideoCapture(i)
-        if cap.isOpened():
-            print(f"✅ Webcam opened on index {i}")
-            return cap
-        cap.release()
-    print("❌ ERROR: Cannot open any webcam.")
-    return None
+                    if identity == "Unknown":
+                        if not self.capturing_unknown:
+                            self.capturing_unknown = True
+                            self.capture_start_time = time.time()
+                            self.capture_stage = 0
+                            self.captured_angles = []
+                            print("[INFO] Unknown detected. Starting capture process...")
 
-# === GUI Setup ===
-window = tk.Tk()
-window.title("Live Face Recognition")
-window.attributes("-fullscreen", True)
+                        if self.capture_stage < 3 and (time.time() - self.capture_start_time) > self.capture_stage * 2:
+                            face_img = frame[top:bottom, left:right]
+                            self.captured_angles.append(face_img)
+                            print(f"[INFO] Captured angle {self.capture_stage + 1}")
+                            self.capture_stage += 1
 
-label = Label(window)
-label.pack()
+                        if self.capture_stage == 3 and not self.prompted_for_name:
+                            self.prompt_for_name()
 
-cap = get_camera()
-if cap is None:
-    window.destroy()
-    exit()
+            self.last_predictions = predictions
 
-# === Save new face to dataset ===
-def save_new_face(face_img, person_name):
-    timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-    save_path = os.path.join("Dataset", "Dataset", "Original Images", "Original Images", person_name)
-    os.makedirs(save_path, exist_ok=True)
-    filename = f"{person_name}_{timestamp}.jpg"
-    cv2.imwrite(os.path.join(save_path, filename), face_img)
-    print(f"✅ Saved new face to {save_path}")
-    load_known_faces()  # Reload embeddings
+        except Exception as e:
+            print("[ERROR] process_frame failed:", e)
 
-# === Label unknown face ===
-def label_unknown(face_img):
-    window.update()
-    person_name = simpledialog.askstring("New Face Detected", "Please enter your name:")
-    if person_name:
-        for _ in range(5):
-            ret, frame = cap.read()
-            if not ret:
-                continue
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-            for (x, y, w, h) in faces:
-                face = frame[y:y + h, x:x + w]
-                if face.size == 0:
-                    continue
-                save_new_face(face, person_name)
-                break
 
-# === Update GUI frames ===
-def update_frame():
-    ret, frame = cap.read()
-    if not ret or frame is None:
-        print("❌ ERROR: Failed to read from camera.")
-        label.after(1000, update_frame)
-        return
-
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-
-    predictions = []
-
-    for (x, y, w, h) in faces:
-        face = frame[y:y+h, x:x+w]
-        if face.size == 0:
-            continue
-        name = recognize_face(face)
-        predictions.append(name)
-        if name == "Unknown":
-            label_unknown(face)
-            return  # Restart after labeling
-
-        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-        cv2.putText(frame, name, (x, y-10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (36, 255, 12), 2)
-
-    # === Smoothing predictions ===
-    if predictions:
-        smoothing_queue.append(predictions[0])
-        most_common = max(set(smoothing_queue), key=smoothing_queue.count)
-        cv2.putText(frame, f"Smoothed: {most_common}", (10, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
-
-    # === Convert frame for Tkinter ===
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    img = Image.fromarray(rgb)
-    imgtk = ImageTk.PhotoImage(image=img)
-    label.imgtk = imgtk
-    label.configure(image=imgtk)
-
-    label.after(10, update_frame)
-
-# === Exit app on Escape key ===
-def on_key(event):
-    if event.keysym == 'Escape':
-        print("👋 Exiting...")
-        cap.release()
-        window.destroy()
-        cv2.destroyAllWindows()
-
-window.bind("<Key>", on_key)
-
-# === Start frame loop ===
-update_frame()
-window.mainloop()
-
-# === Cleanup on close ===
-cap.release()
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = FaceRecognitionApp(root)
+    root.protocol("WM_DELETE_WINDOW", app.stop_recognition)
+    app.start_recognition()
+    root.mainloop()
